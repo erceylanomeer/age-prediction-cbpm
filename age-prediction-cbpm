@@ -1,0 +1,96 @@
+# Gerekli kütüphaneler
+import pandas as pd
+import numpy as np
+from scipy.stats import spearmanr
+from sklearn.linear_model import LinearRegression
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import KFold
+from sklearn.metrics import r2_score, mean_squared_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+# 1. Verileri yüke
+conn = pd.read_csv("conn.csv")
+meta = pd.read_csv("hcp_ya_395unrelated_info.csv")
+
+# 2. Merge islemi
+conn["subject"] = conn["subject"].astype(str)
+meta["Subject"] = meta["Subject"].astype(str)
+df = pd.merge(conn, meta, left_on="subject", right_on="Subject")
+
+# 3. Feature ve hedef ayrımı
+X = df.filter(like="conn")
+y = df["Age_in_Yrs"]
+
+# 4. Spearman korelasyonu ile feature selection
+corrs, pvals = [], []
+for col in X.columns:
+    r, p = spearmanr(X[col], y)
+    corrs.append(r)
+    pvals.append(p)
+
+corr_df = pd.DataFrame({
+    "feature": X.columns,
+    "spearman_r": corrs,
+    "p_value": pvals
+})
+
+# 5. Anlamlı ve pozitif korelasyonluları seç
+selected_features = corr_df[(corr_df["p_value"] < 0.05) & (corr_df["spearman_r"] > 0)]["feature"].tolist()
+
+# 6. Feature aggregation (mean) ve eksik veri doldurma
+X_selected = X[selected_features]
+X_agg = X_selected.mean(axis=1).to_frame(name="agg_feature")
+X_agg = X_agg.fillna(0)  # eksik değerleri 0 ile doldur
+
+# 7. Modeller tanımla
+models = {
+    "Linear Regression": LinearRegression(),
+    "SVR": SVR(),
+    "Random Forest": RandomForestRegressor(random_state=42)
+}
+
+# 8. 5-fold Cross-validation
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+cv_results_all = []
+
+for model_name, model in models.items():
+    r2_scores, rmse_scores = [], []
+    for train_idx, test_idx in kf.split(X_agg):
+        X_train, X_test = X_agg.iloc[train_idx], X_agg.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+
+        r2_scores.append(r2_score(y_test, y_pred))
+        rmse_scores.append(np.sqrt(mean_squared_error(y_test, y_pred)))
+
+    df_model = pd.DataFrame({
+        "Fold": list(range(1, 6)),
+        "Model": model_name,
+        "R2 Score": r2_scores,
+        "RMSE": rmse_scores
+    })
+    cv_results_all.append(df_model)
+
+# 9. Tüm sonuçları birleştir
+cv_all_df = pd.concat(cv_results_all, ignore_index=True)
+mean_scores_df = cv_all_df.groupby("Model")[["R2 Score", "RMSE"]].mean().reset_index()
+
+# 10. Grafik oluştur
+plt.figure(figsize=(10, 6))
+sns.barplot(data=cv_all_df, x="Model", y="R2 Score", ci="sd")
+plt.title("CBPM (manual) - R² Comparison (Linear, SVR, RF)")
+plt.tight_layout()
+plt.savefig("cbpm_r2_comparison.png")
+
+# 11. Excel'e yaz
+with pd.ExcelWriter("cbpm_results_all_models.xlsx") as writer:
+    cv_all_df.to_excel(writer, sheet_name="CV Results", index=False)
+    mean_scores_df.to_excel(writer, sheet_name="Mean Scores", index=False)
+    corr_df.to_excel(writer, sheet_name="Feature Correlations", index=False)
+
+print("Tüm analiz tamamlandı. Sonuçlar kaydedildi.")
